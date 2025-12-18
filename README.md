@@ -1,6 +1,6 @@
 # GPU Cluster Health Monitor
 
-This project automates the monitoring of GPU nodes on the UMBC `chip-gpu` cluster. It uses Slurm's `scontrol` to auto-discover node hardware, compares nodes against their peer groups to detect missing GPUs (e.g., a node showing 5 GPUs when its peers have 8), and generates visual snapshots of cluster health.
+This project automates the monitoring of GPU nodes on the UMBC `chip-gpu` cluster. It uses `scontrol` to auto-discover node hardware, compares nodes against their peer groups to detect missing GPUs (e.g., a node showing 5 GPUs when its peers have 8), and generates visual snapshots of cluster health.
 
 ## 📂 File Structure
 
