@@ -1,209 +1,110 @@
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import subprocess
-import datetime
-import glob
-import os
-import imageio.v2 as imageio
-import sys
+import re
+from collections import defaultdict
 
-# --- Configuration: Expected Specs ---
-# Based on 
-EXPECTED_SPECS = {
-    "RTX 2080Ti": {
-        "nodes": [f"g20-{i:02d}" for i in range(1, 5)], # g20-01 to g20-04
-        "count": 8
-    },
-    "RTX 6000": {
-        "nodes": [f"g20-{i:02d}" for i in range(5, 12)], # g20-05 to g20-11
-        "count": 8
-    },
-    "RTX 8000": {
-        "nodes": ["g20-12", "g20-13"],
-        "count": 8
-    },
-    "L40S": {
-        # g24-01 to g24-08 AND g24-11, g24-12
-        "nodes": [f"g24-{i:02d}" for i in range(1, 9)] + ["g24-11", "g24-12"], 
-        "count": 4
-    },
-    "H100": {
-        "nodes": ["g24-09", "g24-10"],
-        "count": 2
-    },
-}
-
-def get_real_gpu_status():
+def get_slurm_data():
     """
-    Iterates through the expected topology and runs 'srun' to check
-    the physical presence of GPUs on each node via nvidia-smi.
+    Runs 'scontrol show node' once to capture the state of all nodes.
+    Returns a list of dictionaries containing node data.
     """
-    status_map = {}
-    print(f"Starting Cluster GPU Scan at {datetime.datetime.now().strftime('%H:%M:%S')}...")
+    try:
+        # Run scontrol once for the whole cluster (much faster than looping)
+        # -o (oneline) makes parsing slightly easier usually, but standard output is fine too.
+        # We stick to standard output as per your grep example.
+        cmd = ["scontrol", "show", "node"]
+        result = subprocess.check_output(cmd, encoding='utf-8')
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"Error running scontrol: {e}")
+        return ""
 
-    for gpu_type, spec in EXPECTED_SPECS.items():
-        print(f"Scanning {gpu_type} nodes...")
-        for node in spec['nodes']:
-            expected_count = spec['count']
-            
-            # Default to all Bad (False) until proven Good
-            node_status = [False] * expected_count
-            
-            # Command to check GPU indices on the remote node
-            # -w: target node
-            # -N 1 -n 1: run one task
-            # --quiet: suppress srun banners
-            # The breakdown of the required flags
-            cmd = [
-                "srun",
-                "--cluster=chip-gpu",      # Target the GPU cluster
-                "--account=pi_doit",       # Use the privileged account
-                "--partition=support",     # Use the hidden 'support' partition
-                "--time=00:01:00",         # Set a short time limit (1 min is enough for nvidia-smi)
-                "--mem=1G",                # Request minimal memory (1GB)
-                "--gres=gpu:1",            # MANDATORY: You must request a GPU to touch the GPU node
-                "--nodelist={node_name}", # (Presumably you are iterating over nodes here)
-                "nvidia-smi"               # The actual command to run
-            ]
-            try:
-                # Run with a timeout to prevent hanging on down/busy nodes
-                # Adjust timeout (seconds) as needed based on cluster load
-                output = subprocess.check_output(
-                    cmd, shell=True, universal_newlines=True, timeout=10
-                )
-                
-                # Parse output: list of indices found (e.g., "0\n1\n2...")
-                found_indices = [int(x) for x in output.strip().split('\n') if x.strip().isdigit()]
-                
-                # Update status for found GPUs
-                for idx in found_indices:
-                    if idx < expected_count:
-                        node_status[idx] = True
-                    else:
-                        print(f"  [WARN] Node {node} reported GPU index {idx} which exceeds expected {expected_count}")
-
-            except subprocess.TimeoutExpired:
-                print(f"  [ERR] Node {node}: Timed out (Node likely busy or unresponsive)")
-                # Leaves node_status as all False (Red)
-            
-            except subprocess.CalledProcessError:
-                print(f"  [ERR] Node {node}: Connection failed or nvidia-smi error (Node likely DOWN)")
-                # Leaves node_status as all False (Red)
-
-            status_map[node] = node_status
-            
-    return status_map
-
-def draw_cluster_status(status_map, date_str):
+def parse_nodes(raw_output):
     """
-    Generates the visual diagram using Matplotlib.
+    Parses the raw scontrol output into structured data.
     """
-    fig_width = 24
-    # Calculate height based on number of categories
-    fig_height = len(EXPECTED_SPECS) * 3.5 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    nodes = []
+    # Split output by "NodeName=" to isolate node blocks
+    # We ignore the first split if it's empty
+    raw_blocks = raw_output.split("NodeName=")
     
-    # Styling
-    plt.title(f"GPU Infrastructure Status - {date_str}", fontsize=28, pad=20)
-    ax.set_xlim(0, 24)
-    ax.set_ylim(0, len(EXPECTED_SPECS) * 5)
-    ax.axis('off')
-
-    # Legend
-    legend_elements = [
-        patches.Patch(facecolor='green', edgecolor='black', label='Good State (Up)'),
-        patches.Patch(facecolor='red', edgecolor='black', label='Bad State (Down/Missing)')
-    ]
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=14)
-
-    y_offset = len(EXPECTED_SPECS) * 5 - 2
-    
-    for gpu_type, spec in EXPECTED_SPECS.items():
-        # Draw Section Header
-        ax.text(0.5, y_offset + 1.8, gpu_type, fontsize=20, fontweight='bold', va='center')
+    for block in raw_blocks:
+        if not block.strip():
+            continue
+            
+        node_name = block.split()[0]
         
-        # Draw Horizontal Divider
-        ax.hlines(y_offset + 1.2, 0, 24, colors='gray', linestyles='solid', linewidth=0.5)
-
-        x_offset = 2.5
-        current_row_y = y_offset
+        # Extract Features (Hardware Type)
+        # Matches: AvailableFeatures=RTX_2080,rtx_2080...
+        feat_match = re.search(r"AvailableFeatures=([^\s]+)", block)
+        features = feat_match.group(1) if feat_match else "Unknown"
         
-        for node in spec['nodes']:
-            # Get status (True=Good, False=Bad)
-            gpu_states = status_map.get(node, [False] * spec['count'])
-            
-            # Container Box for Node
-            box_width = max(2.2, spec['count'] * 0.5) 
-            rect = patches.Rectangle((x_offset, current_row_y - 1.5), box_width, 2.2, 
-                                     linewidth=1, edgecolor='black', facecolor='#f9f9f9')
-            ax.add_patch(rect)
-            
-            # Node Label
-            ax.text(x_offset + 0.1, current_row_y + 0.3, node, fontsize=10, fontweight='bold')
-            
-            # Draw individual GPUs
-            gpu_x = x_offset + 0.2
-            for i, is_good in enumerate(gpu_states):
-                color = 'green' if is_good else 'red'
-                gpu_rect = patches.Rectangle((gpu_x, current_row_y - 1.2), 0.35, 1.0, 
-                                             linewidth=0, facecolor=color)
-                ax.add_patch(gpu_rect)
-                
-                # GPU ID Text
-                ax.text(gpu_x + 0.175, current_row_y - 1.4, f"G{i}", 
-                        fontsize=7, color='black', ha='center', va='center')
-                
-                gpu_x += 0.45
+        # Extract GPU Count (Gres)
+        # Matches: Gres=gpu:8  OR  Gres=gpu:rtx2080ti:8 (handles variants)
+        # We look for the number at the very end of the gpu string
+        gres_match = re.search(r"Gres=.*gpu:.*?:?(\d+)", block)
+        
+        # If no Gres line, or no number found, assume 0
+        if gres_match:
+            gpu_count = int(gres_match.group(1))
+        else:
+            # Fallback: check for simple "gpu:8" format without subtypes
+            simple_match = re.search(r"Gres=gpu:(\d+)", block)
+            gpu_count = int(simple_match.group(1)) if simple_match else 0
 
-            # Move to next node position
-            x_offset += box_width + 0.5
+        # Filter: We only care about GPU nodes for this report
+        if gpu_count > 0:
+            nodes.append({
+                "name": node_name,
+                "features": features,
+                "gpu_count": gpu_count
+            })
             
-            # Wrap to next line if too many nodes in one row
-            if x_offset > 20:
-                x_offset = 2.5
-                current_row_y -= 2.8
+    return nodes
 
-        # Move Y offset down for the next Category
-        y_offset -= 5
-
-    # Save daily image
-    filename = f"gpu_status_{date_str}.png"
-    plt.tight_layout()
-    plt.savefig(filename, dpi=100)
-    plt.close()
-    print(f"Generated status image: {filename}")
-    return filename
-
-def create_gif():
-    """
-    Compiles all gpu_status_*.png files into an animated GIF.
-    """
-    images = []
-    # Sort primarily by date pattern inside filename
-    filenames = sorted(glob.glob("gpu_status_*.png"))
+def generate_report():
+    print("Gathering cluster status via scontrol...")
+    raw_data = get_slurm_data()
+    nodes = parse_nodes(raw_data)
     
-    if not filenames:
-        print("No images found to generate GIF.")
+    if not nodes:
+        print("No GPU nodes found.")
         return
 
-    print(f"Compiling GIF from {len(filenames)} images...")
-    for filename in filenames:
-        images.append(imageio.imread(filename))
-        
-    # Save GIF (duration is seconds per frame)
-    gif_name = 'gpu_health_trends.gif'
-    imageio.mimsave(gif_name, images, duration=1.0, loop=0)
-    print(f"GIF generated: {gif_name}")
+    # --- LEARNING PHASE (Peer Comparison) ---
+    # Group nodes by their hardware features to find the "Mode" (expected count)
+    feature_groups = defaultdict(list)
+    for node in nodes:
+        feature_groups[node['features']].append(node['gpu_count'])
+    
+    expected_counts = {}
+    for feature, counts in feature_groups.items():
+        # The most frequent GPU count in this group is assumed to be the correct one
+        mode = max(set(counts), key=counts.count)
+        expected_counts[feature] = mode
 
-# --- Execution ---
+    # --- REPORTING PHASE ---
+    print(f"\n{'NODE':<12} {'STATUS':<10} {'GPU_COUNT':<12} {'EXPECTED':<10} {'HARDWARE_CLASS'}")
+    print("-" * 80)
+    
+    # Sort by node name for clean output
+    nodes.sort(key=lambda x: x['name'])
+    
+    for node in nodes:
+        actual = node['gpu_count']
+        expected = expected_counts[node['features']]
+        
+        # Determine Status
+        if actual < expected:
+            status = "\033[91mDEGRADED\033[0m" # Red Text
+        elif actual > expected:
+            status = "\033[93mOVER\033[0m"     # Yellow Text (Unusual but probably fine)
+        else:
+            status = "\033[92mOK\033[0m"       # Green Text
+            
+        # Truncate features for display if they are too long
+        display_features = (node['features'][:30] + '..') if len(node['features']) > 30 else node['features']
+        
+        print(f"{node['name']:<12} {status:<19} {str(actual):<12} {str(expected):<10} {display_features}")
+
 if __name__ == "__main__":
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    
-    # 1. Gather Data (LIVE)
-    current_status = get_real_gpu_status()
-    
-    # 2. Generate Daily Image
-    draw_cluster_status(current_status, today)
-    
-    # 3. Update Trend GIF
-    create_gif()
+    generate_report()
