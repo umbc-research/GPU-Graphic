@@ -1,5 +1,4 @@
 import subprocess
-import json
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from datetime import datetime
@@ -7,6 +6,7 @@ import os
 import glob
 from PIL import Image
 import sys
+import re
 
 # =================CONFIGURATION=================
 # Comma-separated list of your GPU partition names
@@ -19,288 +19,320 @@ ARCHIVE_DIR = "/umbc/rs/pi_doit/users/elliotg2/gpuGraphics/gpu_status_archive"
 GIF_FILENAME = "/umbc/rs/pi_doit/users/elliotg2/gpuGraphics/gpu_status_history.gif"
 
 # Command timeout in seconds (prevent hanging on down nodes)
-TIMEOUT = 45
+TIMEOUT = 10
 # ===============================================
-
 
 def run_command(command):
     """Executes a shell command and returns stdout and return code."""
     try:
-        # print(f"Executing: {command}")
+        # print(f"DEBUG Executing: {command}") 
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=TIMEOUT)
         return result.stdout.strip(), result.returncode
     except subprocess.TimeoutExpired:
-        print(f"Command timed out: {command}")
-        return "", 124 # Standard timeout exit code
+        return "", 124 
 
+def expand_hostlist(hostlist_expr):
+    """
+    Uses 'scontrol show hostnames' to expand SLURM bracket notation 
+    (e.g., node[01-03]) into a python list of strings (node01, node02, node03).
+    """
+    if not hostlist_expr:
+        return []
+    # scontrol show hostnames takes the compressed list and outputs newline-separated hosts
+    cmd = f"scontrol show hostnames '{hostlist_expr}'"
+    stdout, rc = run_command(cmd)
+    if rc == 0:
+        return stdout.splitlines()
+    else:
+        # Fallback: if it's just a single node without brackets, return it
+        return [hostlist_expr]
+
+def clean_gpu_name(raw_name):
+    """Maps raw nvidia-smi/slurm names to clean labels."""
+    raw = raw_name.upper().replace("NVIDIA", "").replace("GEFORCE", "").strip()
+    
+    # Map for canonical names you want in the diagram
+    mapping = {
+        "RTX 2080 TI": "RTX 2080Ti",
+        "2080TI": "RTX 2080Ti",
+        "RTX 6000": "RTX 6000",
+        "QUADRO RTX 6000": "RTX 6000",
+        "RTX 8000": "RTX 8000",
+        "QUADRO RTX 8000": "RTX 8000",
+        "H100": "H100",
+        "A100": "A100",
+        "V100": "V100",
+        "L40S": "L40S"
+    }
+    
+    # Partial match check
+    for key, val in mapping.items():
+        if key in raw:
+            return val
+    
+    return raw # Return cleaned raw string if no map found
+
+def parse_slurm_gres(gres_str):
+    """
+    Parses SLURM GRES string to find GPU type and count.
+    Standard formats: gpu:4, gpu:rtx2080ti:4, gpu:tesla:2
+    Returns (model_name, count)
+    """
+    count = 0
+    model = "Unknown GPU"
+    
+    # Check if this GRES string actually contains gpu info
+    if "gpu" not in gres_str:
+        return model, count
+
+    try:
+        # Split by comma first (gres can be 'gpu:2,mic:1')
+        parts = gres_str.split(',')
+        for part in parts:
+            if part.startswith('gpu'):
+                segments = part.split(':')
+                # format: gpu:count OR gpu:type:count
+                if len(segments) == 2:
+                    # gpu:4
+                    if segments[1].isdigit():
+                        count = int(segments[1])
+                elif len(segments) == 3:
+                    # gpu:type:4
+                    model = segments[1]
+                    if segments[2].isdigit():
+                        count = int(segments[2])
+    except:
+        pass
+        
+    return clean_gpu_name(model), count
 
 def get_gpu_data():
     """
-    Queries SLURM and compute nodes to gather GPU status data.
-    Returns a dictionary structured by node.
+    Queries SLURM for nodes, expands lists, checks status.
     """
     data = {}
     print("Fetching node list from SLURM...")
-    # 1. Get list of nodes, their state, and generic resources (GRES)
-    # Format: NodeName|State|Gres
+    
+    # Get Compressed Node List, State, and GRES
+    # We use -r to try and prevent too much grouping, but scontrol expansion is safer
     sinfo_cmd = f"sinfo -p {PARTITIONS} -h -o '%N|%t|%G'"
     stdout, rc = run_command(sinfo_cmd)
+    
     if rc != 0:
         print(f"Error running sinfo: {stdout}")
         sys.exit(1)
 
-    print(f"Found {len(stdout.splitlines())} nodes. Querying GPUs on each node...")
-    for line in stdout.split('\n'):
-        if not line: continue
+    lines = stdout.split('\n')
+    print(f"Processing SLURM output lines...")
+
+    for line in lines:
+        if not line.strip(): continue
         parts = line.split('|')
         if len(parts) < 3: continue
-        node_name, node_state, gres = parts[0], parts[1], parts[2]
+        
+        compressed_nodes, node_state, gres = parts[0], parts[1], parts[2]
+        
+        # 1. Expand the node list (e.g. g20-[01-05] -> g20-01, g20-02...)
+        individual_nodes = expand_hostlist(compressed_nodes)
+        
+        for node_name in individual_nodes:
+            data[node_name] = {
+                "slurm_state": node_state,
+                "gpus": []
+            }
+            
+            # Identify if node is fundamentally accessible
+            # "drng" = draining, "down" = down. We generally cannot SSH/srun to these.
+            is_accessible = True
+            if "down" in node_state.lower() or "drng" in node_state.lower() or "drain" in node_state.lower():
+                is_accessible = False
 
-        data[node_name] = {
-            "slurm_state": node_state,
-            "gpus": []
-        }
+            # === STRATEGY A: TRY NVIDIA-SMI (If accessible) ===
+            smi_success = False
+            if is_accessible:
+                # print(f"  Querying {node_name}...")
+                nvidia_cmd = f"srun -w {node_name} -n1 -N1 --exclusive --gpu-bind=none nvidia-smi --query-gpu=name,pci.bus_id,index --format=csv,noheader"
+                gpu_stdout, gpu_rc = run_command(nvidia_cmd)
 
-        # 2. Query GPUs directly on the node using nvidia-smi via srun
-        # We use --exclusive to ensure we get the node even if it's busy, 
-        # but this might need adjustment based on your cluster's policy.
-        nvidia_cmd = f"srun -w {node_name} -n1 -N1 --exclusive nvidia-smi --query-gpu=name,pci.bus_id,index --format=csv,noheader"
-        gpu_stdout, gpu_rc = run_command(nvidia_cmd)
+                if gpu_rc == 0 and gpu_stdout:
+                    smi_success = True
+                    for gpu_line in gpu_stdout.split('\n'):
+                        if not gpu_line: continue
+                        gpu_parts = gpu_line.split(',')
+                        if len(gpu_parts) == 3:
+                            raw_model, bus_id, index = [p.strip() for p in gpu_parts]
+                            data[node_name]["gpus"].append({
+                                "model": clean_gpu_name(raw_model),
+                                "index": index,
+                                "state": "good" # If we can query it and node isn't down, it's good
+                            })
 
-        if gpu_rc == 0 and gpu_stdout:
-            # nvidia-smi ran successfully
-            for gpu_line in gpu_stdout.split('\n'):
-                if not gpu_line: continue
-                gpu_parts = gpu_line.split(',')
-                if len(gpu_parts) != 3: continue
-                gpu_model, bus_id, index = [p.strip() for p in gpu_parts]
-
-                # --- GPU State Logic ---
-                # A GPU is "bad" if the node is down or drained in SLURM.
-                # You can add more complex checks here (e.g., parsing nvidia-smi errors).
-                state = "good"
-                if "drain" in node_state.lower() or "down" in node_state.lower() or "*" in node_state:
-                     state = "bad"
+            # === STRATEGY B: FALLBACK TO SLURM GRES (If inaccessible or srun failed) ===
+            if not smi_success:
+                # Determine state: If node is explicitly Down/Drain, it's "bad". 
+                # If it's Alloc/Mix/Idle but srun failed, it's also "bad" (unknown error).
+                status_color = "bad"
                 
-                data[node_name]["gpus"].append({
-                    "model": gpu_model,
-                    "bus_id": bus_id,
-                    "index": index,
-                    "state": state
-                })
-        else:
-            # srun failed (e.g., node is completely down or unreachable).
-            # Fallback: Attempt to parse GRES to define "ghost" bad GPUs.
-            print(f"  Could not query {node_name} (State: {node_state}). Marking GPUs as bad.")
-            gpu_count = 0
-            gpu_model = "Unknown GPU"
-            if "gpu" in gres:
-                try:
-                    # Example GRES formats: gpu:4, gpu:v100:4
-                    gres_parts = gres.split(':')
-                    for i, part in enumerate(gres_parts):
-                        if part == 'gpu':
-                            # Check for gpu:type:count
-                            if i + 2 < len(gres_parts) and gres_parts[i+2].isdigit():
-                                gpu_model = gres_parts[i+1].upper()
-                                gpu_count = int(gres_parts[i+2])
-                            # Check for gpu:count
-                            elif i + 1 < len(gres_parts) and gres_parts[i+1].isdigit():
-                                gpu_count = int(gres_parts[i+1])
-                            break
-                except Exception as e:
-                    print(f"  Failed to parse GRES for {node_name}: {e}")
-
-            for i in range(gpu_count):
-                 data[node_name]["gpus"].append({
-                    "model": gpu_model,
-                    "bus_id": f"N/A",
-                    "index": str(i),
-                    "state": "bad"
-                })
+                # Parse GRES to find out what *should* be there
+                model_name, count = parse_slurm_gres(gres)
+                
+                # If parsed model is generic "Unknown", maybe map based on node name regex if you have naming conventions
+                # e.g. if node starts with "g20", it's a 2080Ti. (Optional customization)
+                
+                if count > 0:
+                    print(f"  Node {node_name} ({node_state}) inaccessible. Adding {count} x {model_name} as BAD.")
+                    for i in range(count):
+                        data[node_name]["gpus"].append({
+                            "model": model_name,
+                            "index": str(i),
+                            "state": status_color
+                        })
+                else:
+                    print(f"  Warning: Node {node_name} is down and has no GRES GPU info.")
 
     return data
 
-
 def organize_data_by_type(raw_data):
-    """Reorganizes data from node-centric to GPU-type-centric for plotting."""
+    """Reorganizes data from node-centric to GPU-type-centric."""
     organized = {}
     for node_name, node_info in raw_data.items():
-        for gpu in node_info["gpus"]:
-            model = gpu["model"]
-            # Clean up model names
-            model = model.replace("NVIDIA", "").replace("GeForce", "").strip()
-            if model not in organized:
-                organized[model] = {}
-            if node_name not in organized[model]:
-                organized[model][node_name] = []
-            organized[model][node_name].append(gpu)
-    # Sort by model name
+        if not node_info["gpus"]: continue
+        
+        # Assume all GPUs on a node are same type for grouping purposes
+        # (Mixed GPU nodes are rare in HPC but possible)
+        first_gpu = node_info["gpus"][0]
+        model = first_gpu["model"]
+        
+        if model not in organized:
+            organized[model] = {}
+        
+        # If node not present, add it
+        if node_name not in organized[model]:
+            organized[model][node_name] = []
+            
+        organized[model][node_name].extend(node_info["gpus"])
+        
     return dict(sorted(organized.items()))
 
-
 def create_status_image(data, filename):
-    """Generates a diagram of GPU status using matplotlib."""
     if not data:
         print("No data to plot.")
         return
 
-    # Dynamic height based on number of GPU types
-    fig_height = max(6, len(data) * 4)
+    # Calculate height
+    total_rows = 0
+    for model in data:
+        # crude estimation of rows needed per model
+        n_nodes = len(data[model])
+        rows = (n_nodes // 5) + 2
+        total_rows += rows
+    
+    fig_height = max(8, total_rows * 1.5)
+    
     fig, ax = plt.subplots(figsize=(20, fig_height))
     ax.set_axis_off()
     
-    # Title and Date
+    # Header
     current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-    ax.text(0.5, 0.98, "GPU Infrastructure Status Diagram", ha='center', va='top', fontsize=20, fontweight='bold')
-    ax.text(0.5, 0.95, f"Last Updated: {current_date}", ha='center', va='top', fontsize=14)
+    ax.text(0.5, 0.98, "GPU Infrastructure Status Diagram", ha='center', va='top', fontsize=24, fontweight='bold')
+    ax.text(0.5, 0.96, f"Last Updated: {current_date}", ha='center', va='top', fontsize=16, color='#555')
 
     # Legend
-    good_patch = patches.Patch(color='green', label='Good State')
-    bad_patch = patches.Patch(color='red', label='Bad State')
-    ax.legend(handles=[good_patch, bad_patch], loc='upper right', bbox_to_anchor=(0.98, 0.98), fontsize=12)
+    legend_y = 0.96
+    ax.add_patch(patches.Rectangle((0.85, legend_y), 0.02, 0.015, facecolor='#28a745', edgecolor='black'))
+    ax.text(0.88, legend_y, "Good State", va='bottom', fontsize=12)
+    ax.add_patch(patches.Rectangle((0.85, legend_y - 0.02), 0.02, 0.015, facecolor='#dc3545', edgecolor='black'))
+    ax.text(0.88, legend_y - 0.02, "Bad / Down", va='bottom', fontsize=12)
 
-    y_offset = 0.88
-    SECTION_SPACING = 0.25
-    SERVER_ROW_SPACING = 0.18
+    # Layout Config
+    y_cursor = 0.90
+    SERVER_WIDTH = 0.15
+    SERVER_HEIGHT = 0.08
+    X_START = 0.05
+    X_GAP = 0.02
+    Y_GAP = 0.06
     
     for gpu_type, nodes in data.items():
-        # --- Section Header ---
-        ax.text(0.02, y_offset, gpu_type, fontsize=18, fontweight='bold', va='center')
-        ax.add_patch(patches.Rectangle((0.02, y_offset - 0.01), 0.96, 0.002, color='black')) # Underline
-
-        # --- Server Block Layout ---
-        x_start = 0.25
-        x_offset = x_start
-        nodes_per_row = 5
-        node_count = 0
-        server_y = y_offset - 0.08
+        # Title for GPU Type
+        ax.text(X_START, y_cursor, gpu_type, fontsize=18, fontweight='bold')
+        ax.add_patch(patches.Rectangle((X_START, y_cursor - 0.005), 0.9, 0.002, color='black'))
+        y_cursor -= 0.04
         
-        sorted_nodes = sorted(nodes.items()) # Sort servers alphabetically
+        x_cursor = X_START
+        
+        # Sort nodes naturally (g20-01, g20-02...)
+        sorted_node_names = sorted(nodes.keys())
+        
+        for node_name in sorted_node_names:
+            gpus = nodes[node_name]
+            
+            # Check for line wrap
+            if x_cursor + SERVER_WIDTH > 0.98:
+                x_cursor = X_START
+                y_cursor -= (SERVER_HEIGHT + 0.04)
 
-        for node_name, gpus in sorted_nodes:
-            if node_count > 0 and node_count % nodes_per_row == 0:
-                server_y -= SERVER_ROW_SPACING
-                x_offset = x_start
+            # Draw Server Box
+            # Determine if whole server is down (all GPUs bad) to maybe color the server box differently?
+            # For now, keep server box grey.
+            ax.add_patch(patches.Rectangle((x_cursor, y_cursor - SERVER_HEIGHT), SERVER_WIDTH, SERVER_HEIGHT, 
+                                           facecolor='#f8f9fa', edgecolor='#6c757d', linewidth=1.5))
             
-            # Server Container Box
-            SERVER_WIDTH = 0.13
-            SERVER_HEIGHT = 0.10
-            server_box = patches.Rectangle((x_offset, server_y - SERVER_HEIGHT), SERVER_WIDTH, SERVER_HEIGHT, 
-                                           linewidth=1.5, edgecolor='#555555', facecolor='#f0f0f0')
-            ax.add_patch(server_box)
-            ax.text(x_offset + 0.005, server_y - 0.005, node_name, fontsize=10, fontweight='bold', va='top')
+            # Server Label
+            ax.text(x_cursor + 0.005, y_cursor - 0.015, node_name, fontsize=11, fontweight='bold')
             
-            # --- GPU Block Layout within Server ---
-            gpu_x = x_offset + 0.005
-            gpu_y = server_y - 0.035
-            GPU_WIDTH = 0.028
-            GPU_HEIGHT = 0.025
-            GPUS_PER_ROW = 4
+            # Draw GPUs
+            # We fit them inside the box.
+            gpu_w = (SERVER_WIDTH - 0.02) / 4 # Assume max 4 per row inside box
+            gpu_h = 0.02
+            
+            gx_start = x_cursor + 0.01
+            gy_start = y_cursor - 0.035
+            
+            gx = gx_start
+            gy = gy_start
             
             for i, gpu in enumerate(gpus):
-                color = '#28a745' if gpu['state'] == 'good' else '#dc3545' # Bootstrap green/red
+                color = '#28a745' if gpu['state'] == 'good' else '#dc3545'
                 
-                # GPU Status Block
-                gpu_box = patches.Rectangle((gpu_x, gpu_y - GPU_HEIGHT), GPU_WIDTH, GPU_HEIGHT, 
-                                            linewidth=1, edgecolor='black', facecolor=color)
-                ax.add_patch(gpu_box)
+                rect = patches.Rectangle((gx, gy - gpu_h), gpu_w - 0.002, gpu_h, facecolor=color, edgecolor='black')
+                ax.add_patch(rect)
                 
-                # Label with GPU Index (e.g., "0", "1")
-                label = gpu['index']
-                ax.text(gpu_x + GPU_WIDTH/2, gpu_y - GPU_HEIGHT/2, label, 
-                        fontsize=8, ha='center', va='center', color='white', fontweight='bold')
+                # Index label
+                ax.text(gx + (gpu_w/2), gy - (gpu_h/2), gpu['index'], 
+                        ha='center', va='center', color='white', fontsize=7, fontweight='bold')
                 
-                gpu_x += GPU_WIDTH + 0.002
-                if (i + 1) % GPUS_PER_ROW == 0:
-                    gpu_x = x_offset + 0.005
-                    gpu_y -= GPU_HEIGHT + 0.005
+                gx += gpu_w
+                if (i + 1) % 4 == 0: # Wrap inside server box if > 4 gpus
+                    gx = gx_start
+                    gy -= (gpu_h + 0.005)
 
-            x_offset += SERVER_WIDTH + 0.02
-            node_count += 1
+            x_cursor += (SERVER_WIDTH + X_GAP)
+            
+        # Move down for next GPU type section
+        y_cursor -= (SERVER_HEIGHT + Y_GAP)
 
-        # Calculate vertical space used by this section's servers
-        rows_used = (node_count - 1) // nodes_per_row + 1
-        y_offset = server_y - SERVER_ROW_SPACING # Move down for next section
-
-    plt.tight_layout()
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
     plt.savefig(filename, dpi=100, bbox_inches='tight')
     plt.close()
-    print(f"Image generated successfully: {filename}")
-
+    print(f"Image generated: {filename}")
 
 def create_gif(image_folder, gif_filename):
-    """Combines all PNGs in a folder into an animated GIF."""
-    # Find all png files, sorted by name (which should be by date)
-    filenames = sorted(glob.glob(os.path.join(image_folder, "gpu_status_*.png")))
-    
-    if not filenames:
-        print("No images found in archive to create GIF.")
-        return
-
-    # Keep only the last 30 days to prevent the GIF from getting too huge
-    filenames = filenames[-30:] 
-
-    images = []
-    for filename in filenames:
-        try:
-            images.append(Image.open(filename))
-        except Exception as e:
-            print(f"Failed to open image {filename}: {e}")
-
-    if images:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(gif_filename), exist_ok=True)
-        
-        # Save as GIF. duration is milliseconds per frame. loop=0 means infinite loop.
-        images[0].save(
-            gif_filename,
-            save_all=True,
-            append_images=images[1:],
-            optimize=False,
-            duration=800, # 0.8 seconds per frame
-            loop=0
-        )
-        print(f"Historical GIF updated: {gif_filename}")
-    else:
-        print("No valid images to create GIF.")
-
+    filenames = sorted(glob.glob(os.path.join(image_folder, "gpu_status_*.png")))[-30:]
+    if not filenames: return
+    images = [Image.open(f) for f in filenames]
+    images[0].save(gif_filename, save_all=True, append_images=images[1:], duration=1000, loop=0)
+    print(f"GIF updated: {gif_filename}")
 
 # =================MAIN=================
 if __name__ == "__main__":
     print("--- Starting GPU Status Generation ---")
-    
-    # 1. Ensure archive directory exists
-    if not os.path.exists(ARCHIVE_DIR):
-        print(f"Creating archive directory: {ARCHIVE_DIR}")
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    if not os.path.exists(ARCHIVE_DIR): os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-    # 2. Gather Data
-    try:
-        raw_data = get_gpu_data()
-    except Exception as e:
-        print(f"Critical error gathering data: {e}")
-        sys.exit(1)
-
-    # 3. Organize Data
-    organized_data = organize_data_by_type(raw_data)
+    data = get_gpu_data()
+    organized = organize_data_by_type(data)
     
-    # 4. Generate Daily Image
-    today_str = datetime.now().strftime("%Y%m%d")
-    daily_image_path = os.path.join(ARCHIVE_DIR, f"gpu_status_{today_str}.png")
+    today = datetime.now().strftime("%Y%m%d")
+    out_file = os.path.join(ARCHIVE_DIR, f"gpu_status_{today}.png")
     
-    try:
-        create_status_image(organized_data, daily_image_path)
-    except Exception as e:
-         print(f"Critical error generating image: {e}")
-         sys.exit(1)
-    
-    # 5. Update Historical GIF
-    try:
-        create_gif(ARCHIVE_DIR, GIF_FILENAME)
-    except Exception as e:
-        print(f"Critical error creating GIF: {e}")
-
+    create_status_image(organized, out_file)
+    create_gif(ARCHIVE_DIR, GIF_FILENAME)
     print("--- Finished ---")
