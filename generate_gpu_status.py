@@ -5,141 +5,181 @@ import datetime
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from collections import defaultdict
+import math
+
+# --- HELPER FUNCTIONS ---
+
+def extract_model_name(features_str):
+    """
+    Attempts to pick the most readable GPU model name from the feature string.
+    e.g., "RTX_2080,rtx_2080,RTX_2080Ti,rtx_2080ti" -> "RTX 2080Ti"
+    """
+    features = features_str.split(',')
+    candidates = []
+    for f in features:
+        # Filter out generic tags and lowercase duplicates
+        if f.lower() in ['gpu', 'location=local']: continue
+        if not f[0].isupper(): continue # Prefer capitalized ones
+        if '=' in f: continue # Ignore k=v tags
+        
+        # Clean up display format (RTX_2080Ti -> RTX 2080Ti)
+        clean_name = f.replace('_', ' ')
+        candidates.append(clean_name)
+        
+    if not candidates:
+        return features_str[:15] # Fallback to raw string truncated
+
+    # Heuristic: The longest specific name is usually the best descriptor
+    # e.g., between RTX 2080 and RTX 2080Ti, pick the latter.
+    best_name = max(candidates, key=len)
+    return best_name
 
 # --- DATA GATHERING ---
 
 def get_slurm_data():
-    """
-    Runs 'scontrol show node' once to capture the state of all nodes.
-    Returns the raw string output.
-    """
+    """Runs 'scontrol show node' once."""
     try:
-        # Run scontrol once for the whole cluster
         cmd = ["scontrol", "show", "node"]
-        result = subprocess.check_output(cmd, encoding='utf-8')
+        result = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
         return result
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         print(f"Error running scontrol: {e}")
         return ""
 
 def parse_nodes(raw_output):
-    """
-    Parses the raw scontrol output into structured data.
-    """
+    """Parses raw output into structured data."""
     nodes = []
-    # Split output by "NodeName=" to isolate node blocks
     raw_blocks = raw_output.split("NodeName=")
     
     for block in raw_blocks:
-        if not block.strip():
-            continue
-            
+        if not block.strip(): continue
         node_name = block.split()[0]
         
-        # Extract Features (Hardware Type)
-        # Matches: AvailableFeatures=RTX_2080,rtx_2080...
+        # Extract raw features string for grouping logic
         feat_match = re.search(r"AvailableFeatures=([^\s]+)", block)
-        features = feat_match.group(1) if feat_match else "Unknown"
+        raw_features = feat_match.group(1) if feat_match else "Unknown"
         
-        # Extract GPU Count (Gres)
-        # Matches: Gres=gpu:8  OR  Gres=gpu:rtx2080ti:8 (handles variants)
+        # Extract pretty model name for display
+        model_display_name = extract_model_name(raw_features)
+        
+        # Extract GPU Count
         gres_match = re.search(r"Gres=.*gpu:.*?:?(\d+)", block)
-        
-        # If no Gres line or complex match, check simple format
         if gres_match:
             gpu_count = int(gres_match.group(1))
         else:
             simple_match = re.search(r"Gres=gpu:(\d+)", block)
             gpu_count = int(simple_match.group(1)) if simple_match else 0
 
-        # Filter: We only care about nodes that actually have GPUs
         if gpu_count > 0:
             nodes.append({
                 "name": node_name,
-                "features": features,
+                "raw_features": raw_features,
+                "model_name": model_display_name,
                 "gpu_count": gpu_count
             })
             
     return nodes
 
-# --- VISUALIZATION ---
+# --- VISUALIZATION (NEW SLOT LOGIC) ---
 
 def save_cluster_image(nodes, expected_counts):
-    """
-    Generates a visual map of the cluster status and saves it to ./images/
-    """
-    # Ensure images directory exists
     if not os.path.exists("images"):
         os.makedirs("images")
 
-    # Sort nodes for consistent placement
     nodes.sort(key=lambda x: x['name'])
 
-    # Grid Configuration
-    total_nodes = len(nodes)
+    # Grid Setup
     cols = 5
-    rows = (total_nodes // cols) + (1 if total_nodes % cols > 0 else 0)
+    rows = math.ceil(len(nodes) / cols)
     
-    # Figure setup (dynamic height based on rows)
-    fig_height = max(6, rows * 1.5) 
-    fig, ax = plt.subplots(figsize=(12, fig_height))
+    fig_height = max(6, rows * 2.0)
+    fig, ax = plt.subplots(figsize=(14, fig_height))
     
-    # Set plot limits to enclose the grid
-    # Coordinates: x goes 0 -> cols*2, y goes 0 -> rows*2
-    ax.set_xlim(0, cols * 2)
-    ax.set_ylim(0, rows * 2)
-    ax.axis('off') # Hide axes
+    # Canvas coordinate space
+    ax.set_xlim(0, cols * 3.0)
+    ax.set_ylim(0, rows * 2.5)
+    ax.axis('off')
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ax.set_title(f"Cluster GPU Health - {timestamp}", fontsize=16, fontweight='bold', y=0.98)
+    ax.set_title(f"Cluster GPU Slots - {timestamp}", fontsize=16, fontweight='bold', y=0.99)
 
-    # Box dimensions
-    box_width = 1.6
-    box_height = 1.2
+    # Node Container Dimensions
+    node_w = 2.6
+    node_h = 2.0
     spacing_x = 0.4
     spacing_y = 0.5
-    
     start_x = 0.2
-    start_y = (rows * 2) - 1.5 # Start from top
+    start_y = (rows * 2.5) - 2.2
+
+    # Colors
+    c_node_bg = '#e0e0e0' # Light grey chassis
+    c_node_border = '#777777'
+    c_led_ok = '#2ecc71'   # Nice green
+    c_led_miss = '#e74c3c' # Nice red
+    c_text = '#2c3e50'
 
     for i, node in enumerate(nodes):
-        # Calculate Grid Position
         curr_row = i // cols
         curr_col = i % cols
         
-        x = start_x + (curr_col * (box_width + spacing_x))
-        y = start_y - (curr_row * (box_height + spacing_y))
+        # Node container position (bottom-left corner)
+        nx = start_x + (curr_col * (node_w + spacing_x))
+        ny = start_y - (curr_row * (node_h + spacing_y))
 
-        # Determine Status & Color
+        # 1. Draw Node Chassis Container
+        chassis = patches.FancyBboxPatch((nx, ny), node_w, node_h, 
+                                       boxstyle="round,pad=0.1", 
+                                       linewidth=1.5, edgecolor=c_node_border, facecolor=c_node_bg)
+        ax.add_patch(chassis)
+
+        # Node Name & Model Text
+        ax.text(nx + node_w/2, ny + node_h - 0.3, node['name'], 
+                ha='center', fontsize=11, fontweight='bold', color=c_text)
+        ax.text(nx + node_w/2, ny + node_h - 0.6, node['model_name'], 
+                ha='center', fontsize=9, fontstyle='italic', color=c_text)
+
+        # 2. Draw GPU Slots (LEDs) inside the chassis
         actual = node['gpu_count']
-        expected = expected_counts[node['features']]
+        expected = expected_counts[node['raw_features']]
         
-        if actual < expected:
-            color = '#ff6b6b' # Red (Degraded)
-            status_text = f"DEGRADED\n{actual}/{expected}"
-        elif actual > expected:
-            color = '#feca57' # Yellow (Over)
-            status_text = f"OVER\n{actual}/{expected}"
-        else:
-            color = '#1dd1a1' # Green (OK)
-            status_text = f"OK\n{actual}/{expected}"
+        # LED Layout definition
+        led_rows = 2
+        led_cols = math.ceil(expected / led_rows)
+        led_w = 0.4
+        led_h = 0.3
+        led_pad_x = 0.1
+        led_pad_y = 0.15
+        
+        # Start position for LEDs (bottom left inside chassis)
+        led_start_x = nx + (node_w - (led_cols*(led_w+led_pad_x)))/2 + led_pad_x/2
+        led_start_y = ny + 0.3
 
-        # Draw Node Box
-        rect = patches.Rectangle((x, y), box_width, box_height, linewidth=1, edgecolor='#333333', facecolor=color)
-        ax.add_patch(rect)
+        slot_idx = 0
+        for lr in range(led_rows -1, -1, -1): # Bottom row first
+            for lc in range(led_cols):
+                if slot_idx >= expected: break # Don't draw extra slots if expected is odd number
 
-        # Add Text Labels
-        # Node Name
-        ax.text(x + box_width/2, y + box_height*0.75, node['name'], 
-                ha='center', va='center', fontsize=10, fontweight='bold', color='#333333')
-        # GPU Count/Status
-        ax.text(x + box_width/2, y + box_height*0.35, status_text, 
-                ha='center', va='center', fontsize=9, color='#333333')
+                lx = led_start_x + (lc * (led_w + led_pad_x))
+                ly = led_start_y + (lr * (led_h + led_pad_y))
+                
+                # Color logic: Green if present, Red if missing slot
+                if slot_idx < actual:
+                    led_color = c_led_ok
+                    edge_color = '#27ae60'
+                else:
+                    led_color = c_led_miss
+                    edge_color = '#c0392b'
+
+                # Draw LED rect
+                led = patches.Rectangle((lx, ly), led_w, led_h, linewidth=1, 
+                                      edgecolor=edge_color, facecolor=led_color)
+                ax.add_patch(led)
+                slot_idx += 1
 
     # Save File
     filename = f"images/status_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     plt.tight_layout()
-    plt.savefig(filename)
+    plt.savefig(filename, dpi=100)
     plt.close()
     print(f"Snapshot saved to: {filename}")
 
@@ -154,42 +194,36 @@ def generate_report():
         print("No GPU nodes found.")
         return
 
-    # --- LEARNING PHASE (Peer Comparison) ---
-    # Group nodes by their hardware features to find the "Mode" (expected count)
+    # Learning Phase (Peer Comparison on raw feature strings)
     feature_groups = defaultdict(list)
     for node in nodes:
-        feature_groups[node['features']].append(node['gpu_count'])
+        feature_groups[node['raw_features']].append(node['gpu_count'])
     
     expected_counts = {}
     for feature, counts in feature_groups.items():
-        # The most frequent GPU count in this group is assumed to be the correct one
-        if not counts:
-            continue
+        if not counts: continue
         mode = max(set(counts), key=counts.count)
         expected_counts[feature] = mode
 
-    # --- TEXT REPORTING PHASE ---
-    print(f"\n{'NODE':<12} {'STATUS':<10} {'GPU_COUNT':<12} {'EXPECTED':<10} {'HARDWARE_CLASS'}")
-    print("-" * 80)
-    
+    # Text Report
+    print(f"\n{'NODE':<12} {'STATUS':<12} {'MODEL':<20} {'SLOTS (ACT/EXP)'}")
+    print("-" * 65)
     nodes.sort(key=lambda x: x['name'])
-    
     for node in nodes:
         actual = node['gpu_count']
-        expected = expected_counts[node['features']]
+        expected = expected_counts[node['raw_features']]
         
-        # Determine Status
         if actual < expected:
-            status = "\033[91mDEGRADED\033[0m" # Red Text
+            status = "\033[91mDEGRADED\033[0m"
         elif actual > expected:
-            status = "\033[93mOVER\033[0m"     # Yellow Text
+            status = "\033[93mOVER\033[0m"
         else:
-            status = "\033[92mOK\033[0m"       # Green Text
+            status = "\033[92mOK\033[0m"
             
-        display_features = (node['features'][:30] + '..') if len(node['features']) > 30 else node['features']
-        print(f"{node['name']:<12} {status:<19} {str(actual):<12} {str(expected):<10} {display_features}")
+        slots = f"{actual}/{expected}"
+        print(f"{node['name']:<12} {status:<21} {node['model_name']:<20} {slots:<15}")
 
-    # --- IMAGE GENERATION PHASE ---
+    # Image Generation
     save_cluster_image(nodes, expected_counts)
 
 if __name__ == "__main__":
